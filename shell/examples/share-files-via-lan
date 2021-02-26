@@ -1,0 +1,13 @@
+#!/bin/bash
+rm /bin/share
+echo '#!/bin/bash' >> /bin/share
+echo 'deepin-terminal -e "python3 -m http.server" -w $1 --keep-open' >> /bin/share
+chmod +x /bin/share
+rm /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo '[Desktop Entry]' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo 'Name=分享到局域网' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo 'GenericName=分享到局域网' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo 'Type=Application' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo 'MimeType=inode/directory;' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo 'Exec=share %U' >> /usr/share/deepin/dde-file-manager/oem-menuextensions/share.desktop
+echo Done

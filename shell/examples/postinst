@@ -1,0 +1,396 @@
+#!/bin/sh
+#
+# Copyright (c) 2009 The Chromium Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+set -e
+
+# Add icons to the system icons
+XDG_ICON_RESOURCE="`which xdg-icon-resource 2> /dev/null || true`"
+if [ ! -x "$XDG_ICON_RESOURCE" ]; then
+  echo "Error: Could not find xdg-icon-resource" >&2
+  exit 1
+fi
+for icon in product_logo_32_dev.png product_logo_64_dev.png product_logo_16_dev.png product_logo_48_dev.png product_logo_128_dev.png product_logo_24_dev.png product_logo_256_dev.png ; do
+  size="$(echo ${icon} | sed 's/[^0-9]//g')"
+  "$XDG_ICON_RESOURCE" install --size "${size}" "/opt/microsoft/msedge-dev/${icon}" \
+    "microsoft-edge-dev"
+done
+
+UPDATE_MENUS="`which update-menus 2> /dev/null || true`"
+if [ -x "$UPDATE_MENUS" ]; then
+  update-menus
+fi
+
+# Update cache of .desktop file MIME types. Non-fatal since it's just a cache.
+update-desktop-database > /dev/null 2>&1 || true
+
+# Updates defaults.list file if present.
+update_defaults_list() {
+  # $1: name of the .desktop file
+
+  local DEFAULTS_FILE="/usr/share/applications/defaults.list"
+
+  if [ ! -f "${DEFAULTS_FILE}" ]; then
+    return
+  fi
+
+  # Split key-value pair out of MimeType= line from the .desktop file,
+  # then split semicolon-separated list of mime types (they should not contain
+  # spaces).
+  mime_types="$(grep MimeType= /usr/share/applications/${1} |
+                cut -d '=' -f 2- |
+                tr ';' ' ')"
+  for mime_type in ${mime_types}; do
+    if egrep -q "^${mime_type}=" "${DEFAULTS_FILE}"; then
+      if ! egrep -q "^${mime_type}=.*${1}" "${DEFAULTS_FILE}"; then
+        default_apps="$(grep ${mime_type}= "${DEFAULTS_FILE}" |
+                        cut -d '=' -f 2-)"
+        egrep -v "^${mime_type}=" "${DEFAULTS_FILE}" > "${DEFAULTS_FILE}.new"
+        echo "${mime_type}=${default_apps};${1}" >> "${DEFAULTS_FILE}.new"
+        mv "${DEFAULTS_FILE}.new" "${DEFAULTS_FILE}"
+      fi
+    else
+      # If there's no mention of the mime type in the file, add it.
+      echo "${mime_type}=${1};" >> "${DEFAULTS_FILE}"
+    fi
+  done
+}
+
+update_defaults_list "microsoft-edge-dev.desktop"
+
+# This function uses sed to insert the contents of one file into another file,
+# after the first line matching a given regular expression. If there is no
+# matching line, then the file is unchanged.
+insert_after_first_match() {
+  # $1: file to update
+  # $2: regular expression
+  # $3: file to insert
+  sed -i -e "1,/$2/ {
+    /$2/ r $3
+    }" "$1"
+}
+
+# If /usr/share/gnome-control-center/default-apps/gnome-default-applications.xml
+# exists, it may need to be updated to add ourselves to the default applications
+# list. If we find the file and it does not seem to contain our patch already
+# (the patch is safe to leave even after uninstall), update it.
+GNOME_DFL_APPS=/usr/share/gnome-control-center/default-apps/gnome-default-applications.xml
+if [ -f "$GNOME_DFL_APPS" ]; then
+# Conditionally insert the contents of the file "default-app-block" after the
+# first "<web-browsers>" line we find in gnome-default-applications.xml
+  fgrep -q "Microsoft Edge (dev)" "$GNOME_DFL_APPS" || insert_after_first_match \
+    "$GNOME_DFL_APPS" \
+    "^[ 	]*<web-browsers>[ 	]*$" \
+    "/opt/microsoft/msedge-dev/default-app-block"
+fi
+
+# Add to the alternatives system
+#
+# On Ubuntu 12.04, we have the following priorities
+# (which can be obtain be installing browsers and running
+# update-alternatives --query x-www-browser):
+#
+# /usr/bin/epiphany-browser  85
+# /usr/bin/firefox           40
+# /usr/bin/konqueror         30
+#
+# While we would expect these values to be keyed off the most popular
+# browser (Firefox), in practice, we treat Epiphany as the lower bound,
+# resulting in the following scheme:
+
+CHANNEL=dev
+case $CHANNEL in
+  stable )
+    # Good enough to be the default.
+    PRIORITY=200
+    ;;
+  beta )
+    # Almost good enough to be the default. (Firefox stable should arguably be
+    # higher than this, but since that's below the "Epiphany threshold", we're
+    # not setting our priority below it. Anyone want to poke Firefox to raise
+    # their priority?)
+    PRIORITY=150
+    ;;
+  unstable )
+    # Unstable, give it the "lowest" priority.
+    PRIORITY=120
+    ;;
+  * )
+    PRIORITY=0
+    ;;
+esac
+
+update-alternatives --install /usr/bin/x-www-browser x-www-browser \
+  /usr/bin/microsoft-edge-dev $PRIORITY
+update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser \
+  /usr/bin/microsoft-edge-dev $PRIORITY
+
+update-alternatives --install /usr/bin/microsoft-edge microsoft-edge \
+  /usr/bin/microsoft-edge-dev $PRIORITY
+
+# PUMP: DO NOT MERGE UPSTREAM CHANGES
+
+# System-wide package configuration.
+DEFAULTS_FILE="/etc/default/microsoft-edge-dev"
+
+# sources.list setting for microsoft-edge-dev updates.
+REPOCONFIG="deb [arch=amd64] http://packages.microsoft.com/repos/edge/ stable main"
+REPOCONFIGREGEX="deb (\[arch=[^]]*\bamd64\b[^]]*\][[:space:]]*) https?://packages.microsoft.com/repos/edge/ stable main"
+
+# Microsoft-specific packaging changes
+ms_key_url=https://packages.microsoft.com/keys/microsoft.asc
+ms_key_hash=EB3E94ADBE1229CF
+# rpm-only
+ms_key_package=gpg-pubkey-be1229cf-5631588c
+
+# ms_key_* defined in variables.include
+
+APT_GET="`which apt-get 2> /dev/null`"
+APT_CONFIG="`which apt-config 2> /dev/null`"
+
+SOURCES_PREAMBLE="### THIS FILE IS AUTOMATICALLY CONFIGURED ###
+# You may comment out this entry, but any other modifications may be lost.\n"
+
+# Install the repository/package signing keys, if they aren't already.
+# (see also: https://packages.microsoft.com/)
+install_key() {
+  APT_KEY="`which apt-key 2> /dev/null`"
+  if [ ! -x "$APT_KEY" ]; then
+    return
+  fi
+
+  MS_NEED_KEYS=0
+
+  # packages.microsoft.com
+  "$APT_KEY" export $ms_key_hash 2>&1 | \
+    grep -q -- "-----BEGIN PGP PUBLIC KEY BLOCK-----"
+  if [ $? -ne 0 ]; then
+    MS_NEED_KEYS=1
+  fi
+
+  if [ -n "$NEED_KEYS" ]; then
+    echo "Error: NEED_KEYS, is set. Only MS_NEED_KEYS should be set."
+    echo "This might be due to a bad merge."
+    exit 1
+  fi
+
+  # Note for future merges: the PGP block below was intentionally
+  # changed from a Google key to a Microsoft (packages.microsoft.com)
+  # key.
+
+  if [ $MS_NEED_KEYS -eq 1 ]; then
+    "$APT_KEY" add - >/dev/null 2>&1 <<KEYDATA
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: GnuPG v1.4.7 (GNU/Linux)
+
+mQENBFYxWIwBCADAKoZhZlJxGNGWzqV+1OG1xiQeoowKhssGAKvd+buXCGISZJwT
+LXZqIcIiLP7pqdcZWtE9bSc7yBY2MalDp9Liu0KekywQ6VVX1T72NPf5Ev6x6DLV
+7aVWsCzUAF+eb7DC9fPuFLEdxmOEYoPjzrQ7cCnSV4JQxAqhU4T6OjbvRazGl3ag
+OeizPXmRljMtUUttHQZnRhtlzkmwIrUivbfFPD+fEoHJ1+uIdfOzZX8/oKHKLe2j
+H632kvsNzJFlROVvGLYAk2WRcLu+RjjggixhwiB+Mu/A8Tf4V6b+YppS44q8EvVr
+M+QvY7LNSOffSO6Slsy9oisGTdfE39nC7pVRABEBAAG0N01pY3Jvc29mdCAoUmVs
+ZWFzZSBzaWduaW5nKSA8Z3Bnc2VjdXJpdHlAbWljcm9zb2Z0LmNvbT6JATUEEwEC
+AB8FAlYxWIwCGwMGCwkIBwMCBBUCCAMDFgIBAh4BAheAAAoJEOs+lK2+EinPGpsH
+/32vKy29Hg51H9dfFJMx0/a/F+5vKeCeVqimvyTM04C+XENNuSbYZ3eRPHGHFLqe
+MNGxsfb7C7ZxEeW7J/vSzRgHxm7ZvESisUYRFq2sgkJ+HFERNrqfci45bdhmrUsy
+7SWw9ybxdFOkuQoyKD3tBmiGfONQMlBaOMWdAsic965rvJsd5zYaZZFI1UwTkFXV
+KJt3bp3Ngn1vEYXwijGTa+FXz6GLHueJwF0I7ug34DgUkAFvAs8Hacr2DRYxL5RJ
+XdNgj4Jd2/g6T9InmWT0hASljur+dJnzNiNCkbn9KbX7J/qK1IbR8y560yRmFsU+
+NdCFTW7wY0Fb1fWJ+/KTsC4=
+=J6gs
+-----END PGP PUBLIC KEY BLOCK-----
+KEYDATA
+  fi
+}
+
+# Set variables for the locations of the apt sources lists.
+find_apt_sources() {
+  eval $("$APT_CONFIG" shell APT_SOURCESDIR 'Dir::Etc::sourceparts/d')
+}
+
+# Update the Microsoft repository if it's not set correctly.
+# Note: this doesn't necessarily enable the repository, it just makes sure the
+# correct settings are available in the sources list.
+# Returns:
+# 0 - no update necessary
+# 2 - error
+update_bad_sources() {
+  if [ ! "$REPOCONFIG" ]; then
+    return 0
+  fi
+
+  find_apt_sources
+
+  SOURCELIST="$APT_SOURCESDIR/microsoft-edge-dev.list"
+  # Don't do anything if the file isn't there, since that probably means the
+  # user disabled it.
+  if [ ! -r "$SOURCELIST" ]; then
+    return 0
+  fi
+
+  # Basic check for active configurations (non-blank, non-comment lines).
+  ACTIVECONFIGS=$(grep -v "^[[:space:]]*\(#.*\)\?$" "$SOURCELIST" 2>/dev/null)
+
+  # Check if the correct repository configuration is in there.
+  REPOMATCH=$(grep -E "^[[:space:]#]*\b$REPOCONFIGREGEX\b" "$SOURCELIST" \
+    2>/dev/null)
+
+  # Check if the correct repository is disabled.
+  MATCH_DISABLED=$(echo "$REPOMATCH" | grep "^[[:space:]]*#" 2>/dev/null)
+
+  # Now figure out if we need to fix things.
+  BADCONFIG=1
+  if [ "$REPOMATCH" ]; then
+    # If it's there and active, that's ideal, so nothing to do.
+    if [ ! "$MATCH_DISABLED" ]; then
+      BADCONFIG=0
+    else
+      # If it's not active, but neither is anything else, that's fine too.
+      if [ ! "$ACTIVECONFIGS" ]; then
+        BADCONFIG=0
+      fi
+    fi
+  fi
+
+  if [ $BADCONFIG -eq 0 ]; then
+    return 0
+  fi
+
+  # At this point, either the correct configuration is completely missing, or
+  # the wrong configuration is active. In that case, just abandon the mess and
+  # recreate the file with the correct configuration. If there were no active
+  # configurations before, create the new configuration disabled.
+  DISABLE=""
+  if [ ! "$ACTIVECONFIGS" ]; then
+    DISABLE="#"
+  fi
+  printf "$SOURCES_PREAMBLE" > "$SOURCELIST"
+  printf "$DISABLE$REPOCONFIG\n" >> "$SOURCELIST"
+  if [ $? -eq 0 ]; then
+    return 0
+  fi
+  return 2
+}
+
+# Add the Microsoft repository to the apt sources.
+# Returns:
+# 0 - sources list was created
+# 2 - error
+create_sources_lists() {
+  if [ ! "$REPOCONFIG" ]; then
+    return 0
+  fi
+
+  find_apt_sources
+
+  SOURCELIST="$APT_SOURCESDIR/microsoft-edge-dev.list"
+  if [ -d "$APT_SOURCESDIR" ]; then
+    printf "$SOURCES_PREAMBLE" > "$SOURCELIST"
+    printf "$REPOCONFIG\n" >> "$SOURCELIST"
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+  fi
+  return 2
+}
+
+# Remove our custom sources list file.
+# Returns:
+# 0 - successfully removed, or not configured
+# !0 - failed to remove
+clean_sources_lists() {
+  if [ ! "$REPOCONFIG" ]; then
+    return 0
+  fi
+
+  find_apt_sources
+
+  rm -f "$APT_SOURCESDIR/microsoft-edge-dev.list" \
+        "$APT_SOURCESDIR/microsoft-edge-dev-dev.list"
+}
+
+# Detect if the repo config was disabled by distro upgrade and enable if
+# necessary.
+handle_distro_upgrade() {
+  if [ ! "$REPOCONFIG" ]; then
+    return 0
+  fi
+
+  find_apt_sources
+  SOURCELIST="$APT_SOURCESDIR/microsoft-edge-dev.list"
+  if [ -r "$SOURCELIST" ]; then
+    REPOLINE=$(grep -E "^[[:space:]]*#[[:space:]]*$REPOCONFIGREGEX[[:space:]]*# disabled on upgrade to .*" "$SOURCELIST")
+    if [ $? -eq 0 ]; then
+      sed -i -e "s,^[[:space:]]*#[[:space:]]*\(.*\)[[:space:]]*# disabled on upgrade to .*,\1," \
+        "$SOURCELIST"
+      LOGGER=$(which logger 2> /dev/null)
+      if [ "$LOGGER" ]; then
+        "$LOGGER" -t "$0" "Reverted repository modification: $REPOLINE."
+      fi
+    fi
+  fi
+}
+
+DEFAULT_ARCH="amd64"
+
+get_lib_dir() {
+  if [ "$DEFAULT_ARCH" = "i386" ]; then
+    LIBDIR=lib/i386-linux-gnu
+  elif [ "$DEFAULT_ARCH" = "amd64" ]; then
+    LIBDIR=lib/x86_64-linux-gnu
+  elif [ "$DEFAULT_ARCH" = "armhf" ]; then
+    LIBDIR=lib/arm-linux-gnueabihf
+  elif [ "$DEFAULT_ARCH" = "arm64" ]; then
+    LIBDIR=lib/aarch64-linux-gnu
+  elif [ "$DEFAULT_ARCH" = "mipsel" ]; then
+    LIBDIR=lib/mipsel-linux-gnu
+  elif [ "$DEFAULT_ARCH" = "mips64el" ]; then
+    LIBDIR=lib/mips64el-linux-gnuabi64
+  else
+    echo Unknown CPU Architecture: "$DEFAULT_ARCH"
+    exit 1
+  fi
+}
+
+NSS_FILES="libnspr4.so.0d libplds4.so.0d libplc4.so.0d libssl3.so.1d \
+    libnss3.so.1d libsmime3.so.1d libnssutil3.so.1d"
+
+add_nss_symlinks() {
+  get_lib_dir
+  for f in $NSS_FILES
+  do
+    target=$(echo $f | sed 's/\.[01]d$//')
+    if [ -f "/$LIBDIR/$target" ]; then
+      ln -snf "/$LIBDIR/$target" "/opt/microsoft/msedge-dev/$f"
+    elif [ -f "/usr/$LIBDIR/$target" ]; then
+      ln -snf "/usr/$LIBDIR/$target" "/opt/microsoft/msedge-dev/$f"
+    else
+      echo $f not found in "/$LIBDIR/$target" or "/usr/$LIBDIR/$target".
+      exit 1
+    fi
+  done
+}
+
+remove_nss_symlinks() {
+  for f in $NSS_FILES
+  do
+    rm -rf "/opt/microsoft/msedge-dev/$f"
+  done
+}
+
+remove_udev_symlinks() {
+  rm -rf "/opt/microsoft/msedge-dev/libudev.so.0"
+}
+
+remove_udev_symlinks
+
+## MAIN ##
+if [ ! -e "$DEFAULTS_FILE" ]; then
+  echo 'repo_add_once="true"' > "$DEFAULTS_FILE"
+  echo 'repo_reenable_on_distupgrade="true"' >> "$DEFAULTS_FILE"
+fi
+
+# Run the cron job immediately to perform repository configuration.
+nohup sh /etc/cron.daily/microsoft-edge-dev > /dev/null 2>&1 &
